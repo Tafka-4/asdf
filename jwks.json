@@ -1,13 +1,9 @@
-{
-  "keys": [
-    {
-      "kty": "RSA",
-      "kid": "server-key",
-      "use": "sig",
-      "alg": "RS256",
-      "n": "MTExMQ==",
-      "e": "MTExMQ==",
-      "d": "MTExMQ=="
-    }
-  ]
-}
+{ "keys": [{
+  "kty": "RSA",
+  "kid": "server-key",
+  "use": "sig",
+  "alg": "RS256",
+  "n": "mmZR--ybQ1vhelPLAckmvE4yC3JnZm_Hqun-KseJVqDrrpItU-J5u_I-l_J1lQfrmwCFiR8JJINbg42wwy11mjBezYiM7DyOnRW48CxRsXujAqVR521_vlNz9Q5MZJS2Z8Bb0wTrxsnP3FgoktE9Q0DXpuETRqw6x_QUib4pTNdOtG6JuCdNgWi_361AzsjyUbnT35UbZw7ct9EMkDLocZJuvn2-173_bj6ksSWffSRBSKO5XK56JzM_5A-mPvQkeqqb7otyBVtDkUdvzMNiN7LqSOan-5RvQcGI_jCza5u7-vj0oIGC6ARMHGvAtT_HcYONmmmNZZQ6vZ2ZlSnGVw",
+  "e": "AQAB",
+  "d": "Sr5pxdkeuJcMKlnSFsU32UTJeT0izTYjpJuuDSuXUraIIXRmOQuT_uYgYxJe1YyGA_1Wp7C8jk6AyMiY34NsQP5Vho4qGlqed3ECnFH4IkFGAovhgHVDt_FSWzlWxgIv4z39tcPWF9-unm6XBawBSkNjokenOzk5I38HSj8iYy2_UKEhpPYpGumCeVwJotNnOYapU5n9UBmzAoP9zzWbozVVySHgGr3yM6z7OxuyNUMYzXor5wGqSrGVyqG9cbMhF5FBuURdF-Nhp0HUogUY93FxKk5HKjo_GOkwNtSJqOaFOcY0tsFKpA1dM58BzXmj9z34PkIvQWvGE2fS4N5H8Q"
+}]}
