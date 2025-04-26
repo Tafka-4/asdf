@@ -5,9 +5,9 @@
       "kid": "server-key",
       "use": "sig",
       "alg": "RS256",
-      "n": "YXNkZg==",
-      "e": "YXNkZg==",
-      "d": "YXNkZg=="
+      "n": "MTExMQ==",
+      "e": "MTExMQ==",
+      "d": "MTExMQ=="
     }
   ]
 }
