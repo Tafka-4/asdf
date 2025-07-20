@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "jwt-ctf-key",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "4lAeVuJJaLGnsw3KsdS3GbfaR6UDrNCmabd2JSiETtz8yScV246slOOgoN1RSRTqaQmsjVZZxg6zmenkzDezi7FGO1Y5ZcrHEl5pX5fDOO_dDUD_-eN98Eb-ejhlZzjDrgXj3xKKMqQ7BwZCJC5hoXEnX3jz21FyK2zuVwmj4Fm3ZPDg7WGQq08j7j9xsjxfNpibh4yNqTPNU263lAC9e12HqEr65DlVo04LEQ3dCvspNZH6AGkUe2kaZJwyjQgQFjL5_uxXi_WnTwX_iToJFGHnlQHPItcp668h0ODBvREUPoFyD_wIPWi2h_1CU-_jVsixOhOWR1LqMTNMKaw7mQ",
+      "e": "AQAB"
+    }
+  ]
+}
