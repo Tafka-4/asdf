@@ -1,0 +1,1 @@
+flag=b"CTF{fake_flag}"

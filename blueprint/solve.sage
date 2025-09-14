@@ -1,0 +1,961 @@
+#!/usr/bin/env sage -python
+# This file mirrors solve.py to satisfy the single-file requirement.
+# It runs as a regular Python script under Sage’s Python.
+
+import sys
+import socket
+import ast
+import random
+import operator as op
+from typing import List, Tuple, Dict, Optional
+
+# Prefer fast vectorized ops when running under Sage's Python
+try:
+    import numpy as np
+    print("[i] Using NumPy for vectorized operations")
+    _HAVE_NUMPY = True
+except Exception:
+    _HAVE_NUMPY = False
+
+# Optional C extension for modular dot products
+try:
+    import fastmod
+    _HAVE_FASTMOD = True
+    print("[i] Using C extension fastmod for modular dots")
+except Exception:
+    _HAVE_FASTMOD = False
+
+try:
+    from z3 import (
+        BitVec, BitVecVal, ZeroExt, Extract, Solver, sat,
+        Int, And, Or, Xor, Distinct, If, BoolVal
+    )
+except Exception as e:
+    print("[!] z3-solver is required: pip install z3-solver", file=sys.stderr)
+    raise
+
+
+BITS = 512
+E = 65537
+
+
+def parse_int_value(line: str) -> int:
+    line = line.strip()
+    if '=' in line:
+        _, v = line.split('=', 1)
+    elif ':' in line:
+        _, v = line.split(':', 1)
+    else:
+        v = line
+    v = v.strip()
+    if v.lower().startswith('0x'):
+        return int(v, 16)
+    return int(v)
+
+
+def parse_list_of_ints(s: str) -> List[int]:
+    try:
+        obj = ast.literal_eval(s.strip())
+        if not isinstance(obj, list):
+            raise ValueError("Not a list")
+        return [int(x) for x in obj]
+    except Exception as e:
+        raise ValueError(f"Failed to parse list: {e}")
+
+
+class ServiceClient:
+    def __init__(self, host: str = '127.0.0.1', port: int = 1338, timeout: float = 5.0):
+        # Cast to native Python types to avoid Sage numeric wrappers
+        self.host = str(host)
+        self.port = int(port)
+        self.timeout = float(timeout)
+        self.sock = None
+        self.f = None
+
+    def __enter__(self):
+        # Ensure host/port are of native acceptable types for socket
+        self.sock = socket.create_connection((str(self.host), int(self.port)), timeout=float(self.timeout))
+        self.sock.settimeout(self.timeout)
+        self.f = self.sock.makefile('rwb', buffering=0)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.f:
+                self.f.close()
+        finally:
+            if self.sock:
+                self.sock.close()
+
+    def send_line(self, s: str):
+        if not s.endswith('\n'):
+            s += '\n'
+        self.f.write(s.encode())
+
+    def recv_line(self) -> str:
+        line = self.f.readline()
+        if not line:
+            raise ConnectionError("Short read from server")
+        return line.decode(errors='replace')
+
+    def get_data(self) -> Dict[str, int]:
+        self.send_line('get_data')
+        data = {}
+        needed = {"n", "leak", "sefu_la_bani", "cei_ce_au_valoarea", "k", "ct"}
+        seen = set()
+        for _ in range(20):
+            line = self.recv_line().strip()
+            if not line:
+                continue
+            if '=' not in line:
+                continue
+            key, rhs = line.split('=', 1)
+            key = key.strip()
+            rhs = rhs.strip()
+            if key == 'n':
+                data['n'] = parse_int_value(rhs)
+                seen.add('n')
+            elif key == 'leak':
+                data['leak'] = parse_int_value(rhs)
+                seen.add('leak')
+            elif key == 'sefu_la_bani':
+                data['sefu_la_bani'] = parse_list_of_ints(rhs)
+                seen.add('sefu_la_bani')
+            elif key == 'cei_ce_au_valoarea':
+                data['cei_ce_au_valoarea'] = parse_int_value(rhs)
+                seen.add('cei_ce_au_valoarea')
+            elif key == 'k':
+                data['k'] = parse_int_value(rhs)
+                seen.add('k')
+            elif key == 'ct':
+                data['ct'] = parse_int_value(rhs)
+                seen.add('ct')
+            if needed.issubset(seen):
+                break
+        if not needed.issubset(seen):
+            raise ValueError("Failed to receive all public data from server")
+        return data
+
+    def query_oracle(self, typ: str, seeds: List[int]) -> int:
+        assert typ in ('x', 'y')
+        assert len(seeds) == 5
+        if any(s <= 0 for s in seeds):
+            raise ValueError("Seeds must be positive")
+        if len(set(seeds)) != 5:
+            raise ValueError("Seeds must be pairwise distinct")
+        self.send_line("query {} {} {} {} {} {}".format(typ, *seeds))
+        line = self.recv_line().strip()
+        if not line.startswith('Output'):
+            line = self.recv_line().strip()
+        if not line.startswith('Output'):
+            raise ValueError(f"Unexpected oracle response: {line}")
+        return parse_int_value(line)
+
+
+def generate_random_shuffle(seed: int, splits: int) -> List[int]:
+    random.seed(int(seed))
+    lst = list(range(int(BITS)))
+    blocks = [lst[j:j + int(splits)] for j in range(0, len(lst), int(splits))]
+    for chunk in blocks:
+        random.shuffle(chunk)
+    return [v for sub in blocks for v in sub]
+
+
+def shuffle_chunk(x: int, perm: List[int]) -> int:
+    res = 0
+    for i in range(int(BITS)):
+        bit = (int(x) >> int(i)) & 1
+        res |= bit << int(perm[i])
+    return res
+
+
+def compute_K(seeds: List[int]) -> int:
+    K = 0
+    for s in seeds:
+        random.seed(int(s))
+        A = 0
+        for _ in range(20):
+            A = op.xor(A, random.randint(0, 2**32 - 1))
+        K = op.xor(K, A)
+    return K & 0xFFFFFFFF
+
+
+def bitwise_majority(values: List[int], width: int = 32) -> int:
+    if not values:
+        return 0
+    n = len(values)
+    out = 0
+    for b in range(width):
+        ones = sum((v >> b) & 1 for v in values)
+        if ones * 2 > n:
+            out |= (1 << b)
+    return out
+
+
+# ==== Oracle seed recovery via XOR-convolution (FWHT) MITM ====
+
+def triple_xor_values_for_seed(seed: int) -> List[int]:
+    random.seed(int(seed))
+    vals = [random.randint(0, 2**32 - 1) for _ in range(20)]
+    out = []
+    # XOR of dropped triple
+    for i in range(20):
+        for j in range(i + 1, 20):
+            vi = op.xor(vals[i], vals[j])
+            for k in range(j + 1, 20):
+                out.append(op.xor(vi, vals[k]))
+    return out
+
+
+def fwht_xor(a: List[int], invert: bool = False) -> None:
+    """In-place FWHT over the reals for XOR-convolution.
+
+    - Uses NumPy vectorized implementation when available (fast, O(n log n)).
+    - Falls back to the original pure-Python loops if NumPy is unavailable.
+    - Forward transform is unnormalized; inverse applies scaling by 1/n.
+    """
+    n = len(a)
+    if n == 0 or (n & (n - 1)) != 0:
+        # Require power-of-two length
+        raise ValueError("FWHT length must be a power of two")
+
+    if _HAVE_NUMPY:
+        # Forward transform in int64 (exact, bounded by total mass)
+        arr = np.asarray(a, dtype=np.int64)
+        h = 1
+        while h < n:
+            # Reshape into (-1, 2*h) blocks and combine in bulk.
+            # Use a copy of the left half to avoid clobbering reads.
+            blk = arr.reshape(-1, 2 * h)
+            u = blk[:, :h].copy()
+            v = blk[:, h:2 * h]
+            blk[:, :h] = u + v
+            blk[:, h:2 * h] = u - v
+            h <<= 1
+
+        if invert:
+            # For inverse, apply 1/n scaling. Keep as float for correlation use.
+            arr = (arr.astype(np.float64) / float(n))
+
+        # Write back to the Python list in-place
+        a[:] = arr.tolist()
+        return
+
+    # Fallback: original pure-Python implementation
+    step = 1
+    while step < n:
+        for i in range(0, n, step << 1):
+            for j in range(i, i + step):
+                u = a[j]
+                v = a[j + step]
+                a[j] = u + v
+                a[j + step] = u - v
+        step <<= 1
+    if invert:
+        inv_n = 1.0 / float(n)
+        for i in range(n):
+            a[i] = a[i] * inv_n
+
+
+def build_pair_freq(Ta: List[int], Tb: List[int], bits: int, high: bool) -> List[int]:
+    """Naive pair XOR histogram (kept for reference/fallback)."""
+    bits = int(bits)
+    mask = (1 << bits) - 1
+    shift = 32 - bits if high else 0
+    size = 1 << bits
+    freq = [0] * size
+    for va in Ta:
+        pa = ((va >> shift) & mask)
+        for vb in Tb:
+            pb = ((vb >> shift) & mask)
+            freq[op.xor(pa, pb)] += 1
+    return freq
+
+
+def build_single_freq(T: List[int], bits: int, high: bool) -> List[int]:
+    bits = int(bits)
+    mask = (1 << bits) - 1
+    shift = 32 - bits if high else 0
+    size = 1 << bits
+    freq = [0] * size
+    for v in T:
+        freq[(v >> shift) & mask] += 1
+    return freq
+
+
+def recover_secret_half_fwht(T1: List[int], T2: List[int], T3: List[int], T4: List[int], T5: List[int], W_list: List[int], bits: int, high: bool, label: Optional[str] = None, topk: Optional[int] = None):
+    bits = int(bits)
+    if label:
+        print(f"[i] Recover {label}: building histograms (bits={bits}, high={high})")
+    # Build single histograms for each set
+    Fa = build_single_freq(T1, bits, high)
+    Fb = build_single_freq(T2, bits, high)
+    Fc = build_single_freq(T3, bits, high)
+    Fd = build_single_freq(T4, bits, high)
+    C = build_single_freq(T5, bits, high)
+    if label:
+        print(f"[i] Recover {label}: FWHT transforms")
+    # Transform single histograms; compute XOR-convolution counts F = F1 ⊗ F2 ⊗ F3 ⊗ F4 ⊗ F5
+    fwht_xor(Fa)
+    fwht_xor(Fb)
+    fwht_xor(Fc)
+    fwht_xor(Fd)
+    fwht_xor(C)
+    size = 1 << bits
+    mask = int(size - 1)
+    shift_amount = int(32 - bits if high else 0)
+    FT = [Fa[i] * Fb[i] * Fc[i] * Fd[i] * C[i] for i in range(size)]
+    F_counts = FT[:]
+    fwht_xor(F_counts, invert=True)
+    # Numerical safety and vectorization via NumPy if available
+    if _HAVE_NUMPY:
+        F_arr = np.asarray(F_counts, dtype=np.float64)
+        # Avoid log(0)
+        F_arr[F_arr <= 0] = 1.0
+        logF = np.log(F_arr)
+        L = np.zeros(size, dtype=np.float64)
+        idx = np.arange(size, dtype=np.int64)
+        if label:
+            print(f"[i] Recover {label}: MLE scoring over {size} candidates using {len(W_list)} samples")
+        for W in W_list:
+            x = int((int(W) >> shift_amount) & mask)
+            # Avoid Sage '^' rewrite: use NumPy bitwise_xor
+            L += logF[np.bitwise_xor(idx, x)]
+        S = L.tolist()
+    else:
+        # Python fallback
+        import math
+        logF = [math.log(fc if fc > 0 else 1.0) for fc in F_counts]
+        S = [0.0] * size
+        if label:
+            print(f"[i] Recover {label}: MLE scoring over {size} candidates using {len(W_list)} samples")
+        for W in W_list:
+            x = int((int(W) >> shift_amount) & mask)
+            for s in range(size):
+                S[s] += logF[op.xor(s, x)]
+    # Collect results
+    if topk is None or topk <= 1:
+        best_idx = max(range(size), key=lambda i: S[i])
+        if label:
+            best_score = S[best_idx]
+            print(f"[i] Recover {label}: best=0x{best_idx:04x} score={best_score}")
+        return best_idx
+    else:
+        # Return top-k indices by score, sorted desc
+        import heapq
+        k = int(topk)
+        # Use nlargest on indices based on score
+        top = heapq.nlargest(k, range(size), key=lambda i: S[i])
+        if label:
+            head = top[0]
+            # Also print a brief top-5 preview for diagnostics
+            preview = ", ".join([f"0x{idx:04x}:{S[idx]}" for idx in top[:5]])
+            print(f"[i] Recover {label}: top{len(top)} collected; head=0x{head:04x} score={S[head]} | top5: {preview}")
+        return [(int(idx), int(S[idx])) for idx in top]
+
+
+def _xperm_vec_from_seed(seed: int) -> List[int]:
+    """Return the 16 values xperm[:128][::8] without building full 512 permutation.
+
+    Mirrors blueprint.generate_random_shuffle(seed, 13) but only for the
+    first 128 positions of the flattened chunk list, then take every 8th.
+    """
+    random.seed(int(seed))
+    bits = int(BITS)
+    splits = 13
+    need = 128
+    out = []
+    j = 0
+    while len(out) < need and j < bits:
+        chunk = list(range(j, min(j + splits, bits)))
+        random.shuffle(chunk)
+        out.extend(chunk)
+        j += splits
+    return out[:need][::8]
+
+
+def _yperm_vec_from_seed(seed: int) -> List[int]:
+    """Return the 16 values yperm[:16] without building full 512 permutation."""
+    random.seed(int(seed))
+    bits = int(BITS)
+    splits = 7
+    need = 16
+    out = []
+    j = 0
+    while len(out) < need and j < bits:
+        chunk = list(range(j, min(j + splits, bits)))
+        random.shuffle(chunk)
+        out.extend(chunk)
+        j += splits
+    return out[:need]
+
+
+def select_seeds_via_checksum(x_half_hi: List[Tuple[int,int]], x_half_lo: List[Tuple[int,int]],
+                              y_half_hi: List[Tuple[int,int]], y_half_lo: List[Tuple[int,int]],
+                              sefu_la_bani: List[int], k: int, rhs: int,
+                              top_pairs_limit: Optional[int] = None) -> Optional[Tuple[int,int]]:
+    """Combine top-half candidates and select seeds that satisfy checksum.
+
+    - x_half_hi/lo and y_half_hi/lo are lists of (value, score) sorted desc.
+    - Returns the first matching (seedx, seedy) or None.
+    - top_pairs_limit optionally caps the number of (hi,lo) pairs per side.
+    """
+    from itertools import product
+
+    a_vec = [int(v) for v in sefu_la_bani[:16]]
+    modk = int(k)
+    rhs = int(rhs) % modk
+
+    def top_pairs_by_score(hi_list, lo_list, cap=None):
+        # Return top pairs by combined score using heap, without enumerating all.
+        import heapq
+        cap = int(cap) if cap is not None else None
+        A = [(int(val), int(score)) for (val, score) in hi_list]
+        B = [(int(val), int(score)) for (val, score) in lo_list]
+        # Sort by score desc
+        A.sort(key=lambda t: t[1], reverse=True)
+        B.sort(key=lambda t: t[1], reverse=True)
+        # Max-heap over combined scores; store negatives for heapq
+        heap = []
+        seen = set()
+        def push(i, j):
+            if i < len(A) and j < len(B) and (i, j) not in seen:
+                seen.add((i, j))
+                heapq.heappush(heap, (-(A[i][1] + B[j][1]), i, j))
+        push(0, 0)
+        out = []
+        limit = cap if cap is not None else (len(A) * len(B))
+        while heap and len(out) < limit:
+            neg, i, j = heapq.heappop(heap)
+            seed = ((A[i][0] << 16) | B[j][0]) & 0xFFFFFFFF
+            out.append((seed, int(-(neg))))
+            push(i + 1, j)
+            push(i, j + 1)
+        return out
+
+    # Compose candidate seeds per side
+    cap_pairs = int(top_pairs_limit) if top_pairs_limit else None
+    x_candidates = top_pairs_by_score(x_half_hi, x_half_lo, cap_pairs)
+    y_candidates = top_pairs_by_score(y_half_hi, y_half_lo, cap_pairs)
+
+    print(f"[i] Candidate seeds: x={len(x_candidates)} y={len(y_candidates)}")
+
+    # Precompute vectors per candidate
+    x_raw = []  # (seedx, [X_i])
+    for seedx, _ in x_candidates:
+        Xvec = _xperm_vec_from_seed(seedx)
+        x_raw.append((seedx, Xvec))
+
+    y_raw = []  # (seedy, [Y_i])
+    for seedy, _ in y_candidates:
+        Yvec = _yperm_vec_from_seed(seedy)
+        y_raw.append((seedy, Yvec))
+
+    print(f"[i] Precomputed vectors per candidate: x={len(x_raw)} y={len(y_raw)}")
+
+    # Sieve with small primes using NumPy to prune pairs, then verify by big-int mod k
+    if _HAVE_NUMPY:
+        small_primes = [536870909, 469762049, 167772161, 2013265921, 1224736769]
+        rhs_mods = [np.int64(int(rhs) % p) for p in small_primes]
+        a_mods = [np.array([int(ai % p) for ai in a_vec], dtype=np.int64) for p in small_primes]
+        Xn = len(x_raw)
+        Yn = len(y_raw)
+        bx = 1024
+        by = 16384
+        print(f"[i] Sieving with {Xn} x candidates and {Yn} y candidates")
+        # Build Y blocks once and reuse across all X blocks
+        for yb in range(0, Yn, by):
+            y_slice = y_raw[yb:yb + by]
+            yb_len = len(y_slice)
+            print("[i] Process: " + str(yb) + " of " + str(Yn))
+            if _HAVE_FASTMOD:
+                Y_block = fastmod.build_block_plus2([Yvec for (_, Yvec) in y_slice])
+            else:
+                Y_block = np.empty((yb_len, 16), dtype=np.int64)
+                for j, (_, Yvec) in enumerate(y_slice):
+                    Y_block[j, :] = [int(v) + 2 for v in Yvec]
+                Y_block = np.ascontiguousarray(Y_block)
+            # Precompute Y mods per prime
+            Ymods = []
+            for idx_p, p in enumerate(small_primes):
+                Ymods.append((Y_block % np.int64(p)))
+
+            # Now sweep X blocks
+            for xb in range(0, Xn, bx):
+                x_slice = x_raw[xb:xb + bx]
+                xb_len = len(x_slice)
+                print("[i] Process: " + str(xb) + " of " + str(Xn))
+                if _HAVE_FASTMOD:
+                    X_block = fastmod.build_block_plus2([Xvec for (_, Xvec) in x_slice])
+                else:
+                    X_block = np.empty((xb_len, 16), dtype=np.int64)
+                    for r, (_, Xvec) in enumerate(x_slice):
+                        X_block[r, :] = [int(v) + 2 for v in Xvec]
+                    X_block = np.ascontiguousarray(X_block)
+                # Precompute X mods per prime: (X_block % p) * a_mods[p] % p
+                Xmods = []
+                for idx_p, p in enumerate(small_primes):
+                    xmod = (X_block % np.int64(p))
+                    xmod = (xmod * a_mods[idx_p]) % np.int64(p)
+                    Xmods.append(xmod)
+                # Apply primes sequentially to prune
+                mask = None
+                for idx_p, p in enumerate(small_primes):
+                    if _HAVE_FASTMOD:
+                        cur = fastmod.dot_eq_mod_mask(np.ascontiguousarray(Xmods[idx_p]), np.ascontiguousarray(Ymods[idx_p]), int(p), int(rhs_mods[idx_p]))
+                    else:
+                        prod = (Xmods[idx_p] @ Ymods[idx_p].T) % np.int64(p)
+                        cur = (prod == rhs_mods[idx_p])
+                    mask = cur if mask is None else (mask & cur)
+                    if not mask.any():
+                        break
+                if mask is not None and mask.any():
+                    x_seeds = np.array([sx for (sx, _) in x_slice], dtype=np.int64)
+                    y_seeds = np.array([sy for (sy, _) in y_slice], dtype=np.int64)
+                    a_modk = [int(ai % modk) for ai in a_vec]
+                    if _HAVE_FASTMOD and hasattr(fastmod, 'verify_first_match_mt'):
+                        res = fastmod.verify_first_match_mt(
+                            np.ascontiguousarray(X_block, dtype=np.int64),
+                            np.ascontiguousarray(Y_block, dtype=np.int64),
+                            x_seeds, y_seeds,
+                            a_modk, int(modk), int(rhs),
+                            np.ascontiguousarray(mask))
+                        if res is not None and res != Py_None:
+                            seedx, seedy = res
+                            print(f"[i] Checksum matched for seeds: seedx={seedx} seedy={seedy}")
+                            return int(seedx), int(seedy)
+                    elif _HAVE_FASTMOD:
+                        res = fastmod.verify_first_match(
+                            np.ascontiguousarray(X_block, dtype=np.int64),
+                            np.ascontiguousarray(Y_block, dtype=np.int64),
+                            x_seeds, y_seeds,
+                            a_modk, int(modk), int(rhs),
+                            np.ascontiguousarray(mask))
+                        if res is not None and res != Py_None:
+                            seedx, seedy = res
+                            print(f"[i] Checksum matched for seeds: seedx={seedx} seedy={seedy}")
+                            return int(seedx), int(seedy)
+                    # Fallback: Python loop
+                    idxs = np.argwhere(mask)
+                    print(f"[i] Found {len(idxs)} matches")
+                    for r, c in idxs:
+                        seedx, Xvec = x_slice[int(r)]
+                        seedy, Yvec = y_slice[int(c)]
+                        s = 0
+                        for i in range(16):
+                            s = (s + a_vec[i] * (int(Xvec[i]) + 2) * (int(Yvec[i]) + 2)) % modk
+                        if s == rhs:
+                            print(f"[i] Checksum matched for seeds: seedx={seedx} seedy={seedy}")
+                            return int(seedx), int(seedy)
+        print("[i] No seed pair matched checksum after sieve")
+        return None
+    else:
+        # Fallback: nested loops (may be slow on large candidate sets)
+        for seedx, Xvec in x_raw:
+            pxi = [(a_vec[i] * (int(Xvec[i]) + 2)) % modk for i in range(16)]
+            for seedy, Yvec in y_raw:
+                yplus = [(int(Yvec[i]) + 2) % modk for i in range(16)]
+                s = 0
+                for i in range(16):
+                    s += pxi[i] * yplus[i]
+                if (s % modk) == rhs:
+                    print(f"[i] Checksum matched for seeds: seedx={seedx} seedy={seedy}")
+                    return int(seedx), int(seedy)
+        print("[i] No seed pair matched checksum in current candidate set")
+        return None
+
+
+def z3_shuffle_bitvec(bv, perm: List[int]):
+    inv = [0] * int(BITS)
+    for i, p in enumerate(perm):
+        inv[int(p)] = int(i)
+    res = BitVecVal(0, int(BITS))
+    for j in range(int(BITS)):
+        bit = Extract(int(inv[j]), int(inv[j]), bv)
+        bit_w = ZeroExt(int(BITS) - int(1), bit)
+        res = res | (bit_w << int(j))
+    return res
+
+
+def bvxor(a, b):
+    """Bit-vector XOR that survives Sage's '^' rewriting."""
+    return a.__xor__(b)
+
+
+def modinv(a: int, m: int) -> int:
+    a %= m
+    try:
+        return pow(a, -1, m)
+    except TypeError:
+        def egcd(x, y):
+            if y == 0:
+                return (1, 0, x)
+            b, a = egcd(y, x % y)
+            return (a, b - (x // y) * a, a)
+        u, v, g = egcd(a, m)
+        if g != 1:
+            raise ValueError("No inverse")
+        return u % m
+
+
+def long_to_bytes(n: int) -> bytes:
+    if n == 0:
+        return b"\x00"
+    length = (n.bit_length() + 7) // 8
+    return n.to_bytes(length, 'big')
+
+
+def recover_seeds_with_oracle(client: ServiceClient,
+                              sefu_la_bani: List[int],
+                              k: int,
+                              cei_ce_au_valoarea: int,
+                              budget: int = 42) -> Tuple[int, int]:
+    # Fixed seed tuples
+    Sx = [101, 202, 303, 404, 505]
+    Sy = [1111, 2222, 3333, 4444, 5555]
+    Kx = compute_K(Sx)
+    Ky = compute_K(Sy)
+
+    # Use balanced query counts under 42 total
+    qx = 21
+    qy = 21
+    if qx + qy > budget:
+        qx = max(1, budget // 2)
+        qy = budget - qx
+
+    # Collect oracle outputs
+    print(f"[i] Oracle queries: x={qx}, y={qy}")
+    xsamp_raw = [client.query_oracle('x', Sx) & 0xFFFFFFFF for _ in range(qx)]
+    ysamp_raw = [client.query_oracle('y', Sy) & 0xFFFFFFFF for _ in range(qy)]
+    print(f"[i] Oracle data collected: x={len(xsamp_raw)}, y={len(ysamp_raw)}")
+
+    # De-bias by removing K_total per sample
+    Wx = [op.xor(v, Kx) & 0xFFFFFFFF for v in xsamp_raw]
+    Wy = [op.xor(v, Ky) & 0xFFFFFFFF for v in ysamp_raw]
+
+    # Precompute triple-xor sets for chosen seeds
+    print("[i] Precomputing triple-xor sets for seeds")
+    T1x = triple_xor_values_for_seed(Sx[0])
+    T2x = triple_xor_values_for_seed(Sx[1])
+    T3x = triple_xor_values_for_seed(Sx[2])
+    T4x = triple_xor_values_for_seed(Sx[3])
+    T5x = triple_xor_values_for_seed(Sx[4])
+
+    T1y = triple_xor_values_for_seed(Sy[0])
+    T2y = triple_xor_values_for_seed(Sy[1])
+    T3y = triple_xor_values_for_seed(Sy[2])
+    T4y = triple_xor_values_for_seed(Sy[3])
+    T5y = triple_xor_values_for_seed(Sy[4])
+
+    # Recover halves independently using FWHT-based XOR convolution (top-K)
+    print("[i] Recovering seed halves via FWHT (top-K)")
+    x_hi_top = recover_secret_half_fwht(T1x, T2x, T3x, T4x, T5x, Wx, bits=16, high=True, label="x_hi", topk=1024)
+    x_lo_top = recover_secret_half_fwht(T1x, T2x, T3x, T4x, T5x, Wx, bits=16, high=False, label="x_lo", topk=1024)
+
+    y_hi_top = recover_secret_half_fwht(T1y, T2y, T3y, T4y, T5y, Wy, bits=16, high=True, label="y_hi", topk=1024)
+    y_lo_top = recover_secret_half_fwht(T1y, T2y, T3y, T4y, T5y, Wy, bits=16, high=False, label="y_lo", topk=1024)
+
+    # Try selecting with modest candidate caps; escalate if needed
+    for cap in [65536, 131072, 262144, 524288, 1048576]:
+        print(f"[i] Selecting seeds via checksum with per-side pair cap={cap}")
+        pick = select_seeds_via_checksum(x_hi_top, x_lo_top, y_hi_top, y_lo_top,
+                                         sefu_la_bani, k, cei_ce_au_valoarea,
+                                         top_pairs_limit=cap)
+        if pick is not None:
+            seedx, seedy = pick
+            print(f"[i] Oracle (FWHT) x_samples={len(Wx)}; y_samples={len(Wy)}")
+            return seedx, seedy
+
+    # Fallback: use best-of-FWHT if no pair matched
+    print("[!] No matching pair found in top-K; falling back to best-only")
+    sx_hi = x_hi_top[0][0] if isinstance(x_hi_top, list) else x_hi_top
+    sx_lo = x_lo_top[0][0] if isinstance(x_lo_top, list) else x_lo_top
+    sy_hi = y_hi_top[0][0] if isinstance(y_hi_top, list) else y_hi_top
+    sy_lo = y_lo_top[0][0] if isinstance(y_lo_top, list) else y_lo_top
+    seedx = ((int(sx_hi) << 16) | int(sx_lo)) & 0xFFFFFFFF
+    seedy = ((int(sy_hi) << 16) | int(sy_lo)) & 0xFFFFFFFF
+    print(f"[i] Oracle (FWHT) x_samples={len(Wx)}; y_samples={len(Wy)}")
+    return seedx, seedy
+
+
+def solve_with_z3(n: int, leak: int, xperm: List[int], yperm: List[int]) -> Tuple[int, int]:
+    width = int(BITS)
+    P = BitVec('P', width)
+    Q = BitVec('Q', width)
+
+    s = Solver()
+
+    msb = int(width) - int(1)
+    s.add(Extract(int(msb), int(msb), P) == BitVecVal(int(1), int(1)))
+    s.add(Extract(int(msb), int(msb), Q) == BitVecVal(int(1), int(1)))
+    s.add(Extract(int(0), int(0), P) == BitVecVal(int(1), int(1)))
+    s.add(Extract(int(0), int(0), Q) == BitVecVal(int(1), int(1)))
+
+    P1024 = ZeroExt(width, P)
+    Q1024 = ZeroExt(width, Q)
+    s.add(P1024 * Q1024 == BitVecVal(int(n), int(width) * int(2)))
+
+    SxP = z3_shuffle_bitvec(P, xperm)
+    SyQ = z3_shuffle_bitvec(Q, yperm)
+    for j in range(width):
+        bit_leak = (int(leak) >> int(j)) & 1
+        lhs = bvxor(Extract(int(j), int(j), SxP), Extract(int(j), int(j), SyQ))
+        s.add(lhs == BitVecVal(int(bit_leak), int(1)))
+
+    print("[i] Solving Z3 constraints... this can take a moment")
+    if s.check() != sat:
+        raise RuntimeError("Z3 solver: UNSAT")
+    m = s.model()
+    Pval = m.eval(P).as_long()
+    Qval = m.eval(Q).as_long()
+    if Pval * Qval != n:
+        if Qval * Pval != n:
+            raise RuntimeError("Model does not multiply to n")
+    return Pval, Qval
+
+
+def solve_with_z3_unknown_perms(n: int, leak: int, splits_x: int = 13, splits_y: int = 7, time_limit_ms: Optional[int] = None) -> Tuple[int, int]:
+    """Solve for P, Q and implicit permutations consistent with the leak.
+
+    - Permutations are modeled implicitly via per-block inverse maps `inv_x[j]` and `inv_y[j]`.
+    - Each block permutes indices only within its block (size `splits_*`, last block smaller).
+    - For each bit j: leak_j == (P_bit[inv_x[j]] XOR Q_bit[inv_y[j]]).
+    - Returns a model for P and Q (seeds/perms not returned).
+    """
+    width = int(BITS)
+    P = BitVec('P', width)
+    Q = BitVec('Q', width)
+    s = Solver()
+    if time_limit_ms is not None:
+        try:
+            s.set(timeout=time_limit_ms)
+        except Exception:
+            pass
+
+    # Basic bit constraints for RSA primes
+    msb = width - 1
+    s.add(Extract(msb, msb, P) == BitVecVal(1, 1))
+    s.add(Extract(msb, msb, Q) == BitVecVal(1, 1))
+    s.add(Extract(0, 0, P) == BitVecVal(1, 1))
+    s.add(Extract(0, 0, Q) == BitVecVal(1, 1))
+
+    # Product constraint
+    P1024 = ZeroExt(width, P)
+    Q1024 = ZeroExt(width, Q)
+    s.add(P1024 * Q1024 == BitVecVal(int(n), width * 2))
+
+    # Build block partitions
+    def blocks(splits: int):
+        out = []
+        j = 0
+        while j < width:
+            end = min(width, j + int(splits))
+            out.append((j, end))
+            j = end
+        return out
+
+    blocks_x = blocks(int(splits_x))
+    blocks_y = blocks(int(splits_y))
+
+    # Inverse-permutation Int vars per output position j
+    inv_x = [Int(f"inv_x_{j}") for j in range(width)]
+    inv_y = [Int(f"inv_y_{j}") for j in range(width)]
+
+    # Domain + Distinct per block
+    for (a, b) in blocks_x:
+        for j in range(a, b):
+            s.add(inv_x[j] >= a, inv_x[j] < b)
+        s.add(Distinct([inv_x[j] for j in range(a, b)]))
+
+    for (a, b) in blocks_y:
+        for j in range(a, b):
+            s.add(inv_y[j] >= a, inv_y[j] < b)
+        s.add(Distinct([inv_y[j] for j in range(a, b)]))
+
+    # Link to leak bits using selector encoding per block
+    for j in range(width):
+        # x-side: bit from P at index inv_x[j]
+        a, b = blocks_x[j // int(splits_x)]
+        px_is_one = []
+        for i in range(a, b):
+            px_is_one.append(And(inv_x[j] == i, Extract(i, i, P) == BitVecVal(1, 1)))
+        px_bit = Or(px_is_one)  # Bool
+
+        # y-side: bit from Q at index inv_y[j]
+        a2, b2 = blocks_y[j // int(splits_y)]
+        qy_is_one = []
+        for i in range(a2, b2):
+            qy_is_one.append(And(inv_y[j] == i, Extract(i, i, Q) == BitVecVal(1, 1)))
+        qy_bit = Or(qy_is_one)  # Bool
+
+        leak_bit = ((int(leak) >> j) & 1) == 1
+        s.add(Xor(px_bit, qy_bit) == BoolVal(leak_bit))
+
+    print("[i] Solving Z3 with unknown permutations; this may be slow…")
+    if s.check() != sat:
+        raise RuntimeError("Z3 unknown-permutation solver: UNSAT")
+    m = s.model()
+    Pval = m.eval(P).as_long()
+    Qval = m.eval(Q).as_long()
+    if Pval * Qval != n:
+        if Qval * Pval != n:
+            raise RuntimeError("Model does not multiply to n")
+    return Pval, Qval
+
+def _simulate_debiased_samples(seeds: List[int], secret: int, q: int) -> List[int]:
+    """Produce debiased oracle samples for testing using the exact model.
+
+    For each of q samples, for each s in seeds:
+    - vals = 20 PRNG 32-bit values from seed s
+    - pick a random 3-subset and XOR them (dropped triple)
+    Output sample = secret ^ XOR_over_seeds(dropped_triple_xor).
+    """
+    rng = random.Random(1337)
+    triples = []  # per seed: (vals, all20_xor)
+    for s in seeds:
+        r = random.Random(int(s))
+        vals = [r.randint(0, 2**32 - 1) for _ in range(20)]
+        triples.append(vals)
+    out = []
+    for _ in range(int(q)):
+        noise = 0
+        for vals in triples:
+            i, j, k = rng.sample(range(20), 3)
+            vij = op.xor(vals[i], vals[j])
+            noise = op.xor(noise, op.xor(vij, vals[k]))
+        out.append(op.xor(int(secret) & 0xFFFFFFFF, noise) & 0xFFFFFFFF)
+    return out
+
+
+def debug_selftest_fwht():
+    print("[i] Running FWHT self-test (synthetic)")
+    S = [101, 202, 303, 404, 505]
+    secret = random.getrandbits(32)
+    Wx = _simulate_debiased_samples(S, secret, q=400)
+    T1 = triple_xor_values_for_seed(S[0])
+    T2 = triple_xor_values_for_seed(S[1])
+    T3 = triple_xor_values_for_seed(S[2])
+    T4 = triple_xor_values_for_seed(S[3])
+    T5 = triple_xor_values_for_seed(S[4])
+    hi_top = recover_secret_half_fwht(T1, T2, T3, T4, T5, Wx, bits=16, high=True, label="self_hi", topk=8)
+    lo_top = recover_secret_half_fwht(T1, T2, T3, T4, T5, Wx, bits=16, high=False, label="self_lo", topk=8)
+    # If lists, take head candidates
+    hi = hi_top[0][0] if isinstance(hi_top, list) else hi_top
+    lo = lo_top[0][0] if isinstance(lo_top, list) else lo_top
+    rec = ((int(hi) << 16) | int(lo)) & 0xFFFFFFFF
+    print(f"[i] Self-test secret=0x{secret:08x} recovered=0x{rec:08x} match={rec==secret}")
+    # Try with fewer bits to gauge signal strength
+    hi8 = recover_secret_half_fwht(T1, T2, T3, T4, T5, Wx, bits=8, high=True, label="self_hi8", topk=8)
+    lo8 = recover_secret_half_fwht(T1, T2, T3, T4, T5, Wx, bits=8, high=False, label="self_lo8", topk=8)
+    hi8v = hi8[0][0] if isinstance(hi8, list) else hi8
+    lo8v = lo8[0][0] if isinstance(lo8, list) else lo8
+    print(f"[i] 8-bit halves: hi=0x{hi8v:02x} lo=0x{lo8v:02x} (true hi=0x{(secret>>24)&0xFF:02x} lo=0x{secret&0xFF:02x})")
+    # Direct correlation check at 8 bits
+    def build_hist(vals, bits, high):
+        mask = (1 << bits) - 1
+        shift = 32 - bits if high else 0
+        H = [0] * (1 << bits)
+        for W in vals:
+            H[((W >> shift) & mask)] += 1
+        return H
+    def xor_convolve(a, b):
+        f = a[:]
+        g = b[:]
+        fwht_xor(f)
+        fwht_xor(g)
+        h = [f[i] * g[i] for i in range(len(f))]
+        fwht_xor(h, invert=True)
+        return h
+    Hh = build_hist(Wx, 8, True)
+    F1 = build_single_freq(T1, 8, True)
+    F2 = build_single_freq(T2, 8, True)
+    F3 = build_single_freq(T3, 8, True)
+    F4 = build_single_freq(T4, 8, True)
+    F5 = build_single_freq(T5, 8, True)
+    F12 = xor_convolve(F1, F2)
+    F34 = xor_convolve(F3, F4)
+    F = xor_convolve(F12, F34)
+    F = xor_convolve(F, F5)
+    # Correlate H with F
+    scores = []
+    for s in range(256):
+        tot = 0
+        for x in range(256):
+            tot += Hh[x] * F[op.xor(x, s)]
+        scores.append(tot)
+    s_best = max(range(256), key=lambda i: scores[i])
+    print(f"[i] 8-bit direct corr: best=0x{s_best:02x} (true=0x{(secret>>24)&0xFF:02x})")
+    # Sanity: triple set generation matches
+    def triples_from_vals(vals):
+        out = []
+        for i in range(20):
+            for j in range(i+1, 20):
+                vij = op.xor(vals[i], vals[j])
+                for k in range(j+1, 20):
+                    out.append(op.xor(vij, vals[k]))
+        return out
+    r0 = random.Random(S[0])
+    vals0 = [r0.randint(0, 2**32 - 1) for _ in range(20)]
+    T1b = triples_from_vals(vals0)
+    print(f"[i] Triple sets equal: {set(T1) == set(T1b)} size={len(T1)}")
+
+
+def main():
+    host = '127.0.0.1'
+    port = 1338
+    if len(sys.argv) >= 2:
+        if sys.argv[1] == 'selftest':
+            debug_selftest_fwht()
+            return
+        host = sys.argv[1]
+    if len(sys.argv) >= 3:
+        port = int(sys.argv[2])
+
+    with ServiceClient(host, port) as cli:
+        pub = cli.get_data()
+        n = int(pub['n'])
+        leak = int(pub['leak'])
+        sefu_la_bani = list(pub['sefu_la_bani'])
+        cei_ce_au_valoarea = int(pub['cei_ce_au_valoarea'])
+        k = int(pub['k'])
+        ct = int(pub['ct'])
+        print(f"[i] Received: n bits={n.bit_length()} ct bits={ct.bit_length()}")
+
+        seedx, seedy = recover_seeds_with_oracle(cli, sefu_la_bani, k, cei_ce_au_valoarea, budget=42)
+        print(f"[i] Recovered seeds: seedx={seedx} seedy={seedy}")
+
+        xperm = generate_random_shuffle(seedx, 13)
+        yperm = generate_random_shuffle(seedy, 7)
+        assert len(xperm) == BITS and len(yperm) == BITS
+
+        try:
+            lhs = sum(a * (X + 2) * (Y + 2)
+                      for a, X, Y in zip(sefu_la_bani, xperm[:128][::8], yperm[:16])) % k
+            ok = (lhs == cei_ce_au_valoarea)
+            print(f"[i] Checksum verification: {ok}")
+            if not ok:
+                print(f"[!] Warning: checksum mismatch (lhs={lhs}, rhs={cei_ce_au_valoarea})")
+        except Exception as e:
+            print(f"[!] Checksum computation failed: {e}")
+            ok = False
+
+        if ok:
+            P, Q = solve_with_z3(n, leak, xperm, yperm)
+        else:
+            P, Q = solve_with_z3_unknown_perms(n, leak, splits_x=13, splits_y=7, time_limit_ms=300000)
+        if P * Q != n:
+            P, Q = Q, P
+        print(f"[i] Factors recovered: P bits={P.bit_length()} Q bits={Q.bit_length()}")
+
+        phi = (P - 1) * (Q - 1)
+        d = modinv(E, phi)
+        m = pow(ct, d, n)
+        flag = long_to_bytes(m)
+        try:
+            print(f"[i] Flag: {flag.decode()}")
+        except Exception:
+            print(f"[i] Flag (bytes): {flag}")
+
+
+if __name__ == '__main__':
+    main()
