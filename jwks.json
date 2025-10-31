@@ -2,11 +2,11 @@
   "keys": [
     {
       "kty": "RSA",
-      "use": "sig",
+      "n": "wL1EyyNLG6gNgU2ycweQ2u6FbiQUYi0xbi9v-5PHldawW2cI5vhHdIs9S5GLmKKgnV9pLAuEdXKsSB5uRMqm9jaXeUEVLPoBdixHBOuzw1F6AVYbQpl8IWCtTfEKl050mx3dvRXq1VMFVtuOpIiz5QsI5ppNi4I-Fbr3V1EKdiXPck7bROeg9pk4uBUuoweU-ib7ZZ5ksq8fEJHfKNWA3KJpd6EEt29k2G6oQSRd3F_NjfC__2Nq7WTRuVFKJ2PfnZp8COkdm0JT84M_SGeXihvBQzwIXzQR5PONRbLS78q4KnN4R23ebGLW2qBkidifuXPPJAJ8lp2Vmb6BfIIEtw",
+      "e": "AQAB",
       "alg": "RS256",
-      "kid": "malicious-ctf-key-1337",
-      "n": "3nW4iAAo6cQWZs9qthkuVwrOEFU05v8plVohVNEZe0jRvPNbxUPr04GDsKGcXp2Gz9baXX-pow8WxXpgcp0sH2IdShGFTxyg1VCh61wFedMoMVPBPXeMz_i826Ly7gOXi4nGuftf_FLnSoWan8NuUw5inqhrjXkUw8BICoIpEBNiPHrBf45jEGLbxWenB_6UjLW_bV3EV9d6tlVgCcgC7RO4P2rNW9eYONGyB1Psn8UcRVq8SPbUrIH71fiB1fxXjP3zFu6etKF2B9yjNFvDxX8UzVxzNwYnbPmrXw-IcyvVwXQcrfH163XcLpSHfC9VGzY2YXyg6uXGIMaaiQYlCw",
-      "e": "AQAB"
+      "use": "sig",
+      "kid": "cAqPhmiBjH1SYxCw9euJW6LNZY0rHcEBiV730xtXVBY"
     }
   ]
 }
